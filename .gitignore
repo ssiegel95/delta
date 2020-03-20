@@ -106,3 +106,4 @@ spark-warehouse/
 # For Python linting
 pep8*.py
 pycodestyle*.py
+COSLogStore.jar
