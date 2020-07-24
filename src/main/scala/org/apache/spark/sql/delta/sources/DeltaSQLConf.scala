@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,6 +58,18 @@ object DeltaSQLConf {
       .internal()
       .doc("Whether to check whether the partition column names have valid names, just like " +
         "the data columns.")
+      .booleanConf
+      .createWithDefault(true)
+
+  val DELTA_SCHEMA_ON_READ_CHECK_ENABLED =
+    buildConf("checkLatestSchemaOnRead")
+      .doc(
+        "In Delta, we always try to give users the latest version of their data without " +
+          "having to call REFRESH TABLE or redefine their DataFrames when used in the context of " +
+          "streaming. There is a possibility that the schema of the latest version of the table " +
+          "may be incompatible with the schema at the time of DataFrame creation. This flag " +
+          "enables a check that ensures that users won't read corrupt data if the source schema " +
+          "changes in an incompatible way.")
       .booleanConf
       .createWithDefault(true)
 
@@ -233,6 +245,17 @@ object DeltaSQLConf {
         """.stripMargin)
       .booleanConf
       .createWithDefault(true)
+
+  val MERGE_REPARTITION_BEFORE_WRITE =
+    buildConf("merge.repartitionBeforeWrite.enabled")
+      .internal()
+      .doc(
+        """
+          |When enabled, merge will repartition the output by the table's partition columns before
+          |writing the files.
+        """.stripMargin)
+      .booleanConf
+      .createWithDefault(false)
 
   val MERGE_MATCHED_ONLY_ENABLED =
     buildConf("merge.optimizeMatchedOnlyMerge.enabled")

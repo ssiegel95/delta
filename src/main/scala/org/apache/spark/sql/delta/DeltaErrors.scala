@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,13 +17,13 @@
 package org.apache.spark.sql.delta
 
 // scalastyle:off import.ordering.noEmptyLine
-import java.io.FileNotFoundException
+import java.io.{FileNotFoundException, IOException}
 import java.util.ConcurrentModificationException
 
 import org.apache.spark.sql.delta.actions.{CommitInfo, Metadata}
 import org.apache.spark.sql.delta.hooks.PostCommitHook
 import org.apache.spark.sql.delta.metering.DeltaLogging
-import org.apache.spark.sql.delta.schema.{Invariant, InvariantViolationException}
+import org.apache.spark.sql.delta.schema.{Invariant, InvariantViolationException, SchemaUtils}
 import org.apache.spark.sql.delta.util.JsonUtils
 import org.apache.hadoop.fs.Path
 
@@ -33,6 +33,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.sql.types.{DataType, StructField, StructType}
 
@@ -87,7 +88,8 @@ trait DocsPath {
     "multipleSourceRowMatchingTargetRowInMergeException",
     "faqRelativePath",
     "ignoreStreamingUpdatesAndDeletesWarning",
-    "concurrentModificationExceptionMsg"
+    "concurrentModificationExceptionMsg",
+    "incorrectLogStoreImplementationException"
   )
 }
 
@@ -150,6 +152,17 @@ object DeltaErrors
       s"written into the table.")
   }
 
+  def incorrectLogStoreImplementationException(
+      sparkConf: SparkConf,
+      cause: Throwable): Throwable = {
+    new IOException(s"""The error typically occurs when the default LogStore implementation, that
+      | is, HDFSLogStore, is used to write into a Delta table on a non-HDFS storage system.
+      | In order to get the transactional ACID guarantees on table updates, you have to use the
+      | correct implementation of LogStore that is appropriate for your storage system.
+      | See ${generateDocsLink(sparkConf, "/delta-storage.html")} " for details.
+      """.stripMargin, cause)
+  }
+
   def staticPartitionsNotSupportedException: Throwable = {
     new AnalysisException("Specifying static partitions in the partition spec is" +
       " currently not supported during inserts")
@@ -190,6 +203,18 @@ object DeltaErrors
   def notADeltaSourceException(command: String, plan: Option[LogicalPlan] = None): Throwable = {
     val planName = if (plan.isDefined) plan.toString else ""
     new AnalysisException(s"$command destination only supports Delta sources.\n$planName")
+  }
+
+  def schemaChangedSinceAnalysis(atAnalysis: StructType, latestSchema: StructType): Throwable = {
+    val schemaDiff = SchemaUtils.reportDifferences(atAnalysis, latestSchema)
+      .map(_.replace("Specified", "Latest"))
+    new AnalysisException(
+      s"""The schema of your Delta table has changed in an incompatible way since your DataFrame or
+         |DeltaTable object was created. Please redefine your DataFrame or DeltaTable object.
+         |Changes:\n${schemaDiff.mkString("\n")}
+         |This check can be turned off by setting the session configuration key
+         |${DeltaSQLConf.DELTA_SCHEMA_ON_READ_CHECK_ENABLED.key} to false.
+       """.stripMargin)
   }
 
   def invalidColumnName(name: String): Throwable = {
@@ -399,6 +424,10 @@ object DeltaErrors
   def illegalDeltaOptionException(name: String, input: String, explain: String): Throwable = {
     new IllegalArgumentException(
       s"Invalid value '$input' for option '$name', $explain")
+  }
+
+  def unrecognizedLogFile(path: Path): Throwable = {
+    new UnsupportedOperationException(s"Unrecognized log file $path")
   }
 
   def modifyAppendOnlyTableException: Throwable = {
@@ -763,7 +792,7 @@ object DeltaErrors
   }
 
   def emptyDirectoryException(directory: String): Throwable = {
-    new RuntimeException(s"No file found in the directory: $directory.")
+    new FileNotFoundException(s"No file found in the directory: $directory.")
   }
 
   def alterTableSetLocationSchemaMismatchException(
@@ -806,6 +835,11 @@ object DeltaErrors
     val supportedModes = DeltaGenerateCommand.modeNameToGenerationFunc.keys.toSeq.mkString(", ")
     new IllegalArgumentException(
       s"Specified mode '$modeName' is not supported. Supported modes are: $supportedModes")
+  }
+
+  def illegalUsageException(option: String, operation: String): Throwable = {
+    throw new IllegalArgumentException(
+      s"The usage of $option is not allowed when $operation a Delta table.")
   }
 
   def columnNotInSchemaException(column: String, schema: StructType): Throwable = {
