@@ -1,1 +1,2 @@
 build/sbt 'set test in assembly := {}' +assembly
+make sure your python env >= 3.6
