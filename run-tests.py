@@ -17,18 +17,14 @@
 #
 
 import os
-import fnmatch
 import subprocess
 from os import path
-import random
-import string
-import tempfile
 
 
 def run_sbt_tests(root_dir):
     print("##### Running SBT tests #####")
     sbt_path = path.join(root_dir, path.join("build", "sbt"))
-    run_cmd([sbt_path, "clean", "+test"], stream_output=True)
+    run_cmd([sbt_path, "clean", "test"], stream_output=True)
 
 
 def run_python_tests(root_dir):

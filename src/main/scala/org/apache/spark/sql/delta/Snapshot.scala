@@ -19,6 +19,8 @@ package org.apache.spark.sql.delta
 // scalastyle:off import.ordering.noEmptyLine
 import java.net.URI
 
+import scala.collection.mutable
+
 import org.apache.spark.sql.delta.actions._
 import org.apache.spark.sql.delta.actions.Action.logSchema
 import org.apache.spark.sql.delta.metering.DeltaLogging
@@ -122,6 +124,16 @@ class Snapshot(
   /** The current set of actions in this [[Snapshot]]. */
   def state: Dataset[SingleAction] = cachedState.getDS
 
+  /** Helper method to log missing actions when state reconstruction checks are not enabled */
+  protected def logMissingActionWarning(action: String): Unit = {
+    logWarning(
+      s"""
+         |Found no $action in computed state, setting it to defaults. State reconstruction
+         |validation was turned off. To turn it back on set
+         |${DeltaSQLConf.DELTA_STATE_RECONSTRUCTION_VALIDATION_ENABLED.key} to "true"
+        """.stripMargin)
+  }
+
   /**
    * Computes some statistics around the transaction log, therefore on the actions made on this
    * Delta table.
@@ -129,9 +141,9 @@ class Snapshot(
   protected lazy val computedState: State = {
     val implicits = spark.implicits
     import implicits._
-    state.select(
-      coalesce(last($"protocol", ignoreNulls = true), defaultProtocol()) as "protocol",
-      coalesce(last($"metaData", ignoreNulls = true), emptyMetadata()) as "metadata",
+    var _computedState = state.select(
+      last($"protocol", ignoreNulls = true) as "protocol",
+      last($"metaData", ignoreNulls = true) as "metadata",
       collect_set($"txn") as "setTransactions",
       // sum may return null for empty data set.
       coalesce(sum($"add.size"), lit(0L)) as "sizeInBytes",
@@ -141,6 +153,31 @@ class Snapshot(
       count($"remove") as "numOfRemoves",
       count($"txn") as "numOfSetTransactions"
     ).as[State](stateEncoder).first()
+    val stateReconstructionCheck = spark.sessionState.conf.getConf(
+      DeltaSQLConf.DELTA_STATE_RECONSTRUCTION_VALIDATION_ENABLED)
+    if (_computedState.protocol == null) {
+      recordDeltaEvent(
+        deltaLog,
+        opType = "delta.assertions.missingAction",
+        data = Map("version" -> version.toString, "action" -> "Protocol", "source" -> "Snapshot"))
+      if (stateReconstructionCheck) {
+        throw DeltaErrors.actionNotFoundException("protocol", version)
+      }
+      logMissingActionWarning("protocol")
+      _computedState = _computedState.copy(protocol = Protocol(spark, None))
+    }
+    if (_computedState.metadata == null) {
+      recordDeltaEvent(
+        deltaLog,
+        opType = "delta.assertions.missingAction",
+        data = Map("version" -> version.toString, "action" -> "Metadata", "source" -> "Metadata"))
+      if (stateReconstructionCheck) {
+        throw DeltaErrors.actionNotFoundException("metadata", version)
+      }
+      logMissingActionWarning("metadata")
+      _computedState = _computedState.copy(metadata = Metadata())
+    }
+    _computedState
   }
 
   def protocol: Protocol = computedState.protocol
@@ -180,6 +217,19 @@ class Snapshot(
   /** Number of columns to collect stats on for data skipping */
   lazy val numIndexedCols: Int = DeltaConfigs.DATA_SKIPPING_NUM_INDEXED_COLS.fromMetaData(metadata)
 
+  /** Return the set of properties of the table. */
+  def getProperties: mutable.HashMap[String, String] = {
+    val base = new mutable.HashMap[String, String]()
+    metadata.configuration.foreach { case (k, v) =>
+      if (k != "path") {
+        base.put(k, v)
+      }
+    }
+    base.put(Protocol.MIN_READER_VERSION_PROP, protocol.minReaderVersion.toString)
+    base.put(Protocol.MIN_WRITER_VERSION_PROP, protocol.minWriterVersion.toString)
+    base
+  }
+
   // Given the list of files from `LogSegment`, create respective file indices to help create
   // a DataFrame and short-circuit the many file existence and partition schema inference checks
   // that exist in DataSource.resolveRelation().
@@ -195,21 +245,25 @@ class Snapshot(
     checkpointFileIndexOpt.toSeq ++ deltaFileIndexOpt.toSeq
   }
 
+  /** Creates a LogicalRelation with the given schema from a DeltaLogFileIndex. */
+  protected def indexToRelation(
+      index: DeltaLogFileIndex,
+      schema: StructType = logSchema): LogicalRelation = {
+    val fsRelation = HadoopFsRelation(
+      index,
+      index.partitionSchema,
+      schema,
+      None,
+      index.format,
+      Map.empty[String, String])(spark)
+    LogicalRelation(fsRelation)
+  }
+
   /**
    * Loads the file indices into a Dataset that can be used for LogReplay.
    */
-  private def loadActions: Dataset[SingleAction] = {
-    val dfs = fileIndices.map { index: DeltaLogFileIndex =>
-      val fsRelation = HadoopFsRelation(
-        index,
-        index.partitionSchema,
-        logSchema,
-        None,
-        index.format,
-        Map.empty[String, String])(spark)
-      Dataset[SingleAction](spark, LogicalRelation(fsRelation))
-    }
-
+  protected def loadActions: Dataset[SingleAction] = {
+    val dfs = fileIndices.map { index => Dataset[SingleAction](spark, indexToRelation(index)) }
     dfs.reduceOption(_.union(_)).getOrElse(emptyActions)
   }
 
@@ -250,10 +304,12 @@ object Snapshot extends DeltaLogging {
   private val defaultNumSnapshotPartitions: Int = 50
 
   /** Canonicalize the paths for Actions */
-  private def canonicalizePath(path: String, hadoopConf: Configuration): String = {
+  private[delta] def canonicalizePath(path: String, hadoopConf: Configuration): String = {
     val hadoopPath = new Path(new URI(path))
     if (hadoopPath.isAbsoluteAndSchemeAuthorityNull) {
+      // scalastyle:off FileSystemGet
       val fs = FileSystem.get(hadoopConf)
+      // scalastyle:on FileSystemGet
       fs.makeQualified(hadoopPath).toUri.toString
     } else {
       // return untouched if it is a relative path or is already fully qualified
@@ -310,8 +366,6 @@ object Snapshot extends DeltaLogging {
   }
 
 
-  private lazy val emptyMetadata = udf(() => Metadata())
-  private lazy val defaultProtocol = udf(() => Protocol())
   implicit private def stateEncoder: Encoder[State] = {
     _stateEncoder.copy()
   }
@@ -329,10 +383,18 @@ class InitialSnapshot(
     val logPath: Path,
     override val deltaLog: DeltaLog,
     override val metadata: Metadata)
-  extends Snapshot(logPath, -1, LogSegment.empty, -1, deltaLog, -1, None) {
+  extends Snapshot(logPath, -1, LogSegment.empty(logPath), -1, deltaLog, -1, None) {
+
+  def this(logPath: Path, deltaLog: DeltaLog) = this(
+    logPath,
+    deltaLog,
+    Metadata(configuration = DeltaConfigs.mergeGlobalConfigs(
+      SparkSession.active.sessionState.conf, Map.empty))
+  )
 
   override def state: Dataset[SingleAction] = emptyActions
   override protected lazy val computedState: Snapshot.State = {
-    Snapshot.State(Protocol(), metadata, Nil, 0L, 0L, 1L, 1L, 0L, 0L)
+    val protocol = Protocol.forNewTable(spark, metadata)
+    Snapshot.State(protocol, metadata, Nil, 0L, 0L, 1L, 1L, 0L, 0L)
   }
 }

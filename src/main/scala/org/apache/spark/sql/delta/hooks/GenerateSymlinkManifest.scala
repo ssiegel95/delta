@@ -40,6 +40,16 @@ import org.apache.spark.util.SerializableConfiguration
  */
 object GenerateSymlinkManifest extends GenerateSymlinkManifestImpl
 
+// A separate singleton to avoid creating encoders from scratch every time
+object GenerateSymlinkManifestUtils extends DeltaLogging {
+  private[hooks] lazy val mapEncoder = try {
+    ExpressionEncoder[Map[String, String]]()
+  } catch {
+    case e: Throwable =>
+      logError(e.getMessage, e)
+      throw e
+  }
+}
 
 trait GenerateSymlinkManifestImpl extends PostCommitHook with DeltaLogging with Serializable {
   val CONFIG_NAME_ROOT = "compatibility.symlinkFormatManifest"
@@ -96,8 +106,8 @@ trait GenerateSymlinkManifestImpl extends PostCommitHook with DeltaLogging with 
       val partitionValuesOfRemovedFiles =
         txnReadSnapshot.allFiles.join(removedFileNames, "path").select("partitionValues").persist()
       try {
-        val partitionsOfRemovedFiles =
-          partitionValuesOfRemovedFiles.as[Map[String, String]].collect().toSet
+        val partitionsOfRemovedFiles = partitionValuesOfRemovedFiles
+          .as[Map[String, String]](GenerateSymlinkManifestUtils.mapEncoder).collect().toSet
 
         // Get the files present in the updated partitions
         val partitionsUpdated: Set[Map[String, String]] =
@@ -336,13 +346,11 @@ trait GenerateSymlinkManifestImpl extends PostCommitHook with DeltaLogging with 
       partitionColNameToAttrib: Seq[(String, Attribute)],
       timeZoneId: String): Expression = Concat(
 
-
     partitionColNameToAttrib.zipWithIndex.flatMap { case ((colName, col), i) =>
       val partitionName = ScalaUDF(
         ExternalCatalogUtils.getPartitionPathString _,
         StringType,
-        Seq(Literal(colName), Cast(col, StringType, Option(timeZoneId))),
-        Seq(true, true))
+        Seq(Literal(colName), Cast(col, StringType, Option(timeZoneId))))
       if (i == 0) Seq(partitionName) else Seq(Literal(Path.SEPARATOR), partitionName)
     }
   )

@@ -49,6 +49,7 @@ trait DeltaWriteOptions
   import DeltaOptions._
 
   val replaceWhere: Option[String] = options.get(REPLACE_WHERE_OPTION)
+  val userMetadata: Option[String] = options.get(USER_METADATA_OPTION)
 
   /**
    * Whether to add an adaptive shuffle before writing out the files to break skew, and coalesce
@@ -76,7 +77,7 @@ trait DeltaWriteOptionsImpl extends DeltaOptionParser {
    * MODIFY permissions, when schema changes require OWN permissions.
    */
   def canOverwriteSchema: Boolean = {
-    options.get(OVERWRITE_SCHEMA_OPTION).map(toBoolean(_, OVERWRITE_SCHEMA_OPTION)).getOrElse(false)
+    options.get(OVERWRITE_SCHEMA_OPTION).exists(toBoolean(_, OVERWRITE_SCHEMA_OPTION))
   }
 
   /**
@@ -86,7 +87,7 @@ trait DeltaWriteOptionsImpl extends DeltaOptionParser {
    * This makes sure streaming queries reading from this table will not see any new changes
    */
   def rearrangeOnly: Boolean = {
-    options.get(DATA_CHANGE_OPTION).map(!toBoolean(_, DATA_CHANGE_OPTION)).getOrElse(false)
+    options.get(DATA_CHANGE_OPTION).exists(!toBoolean(_, DATA_CHANGE_OPTION))
   }
 
 }
@@ -109,19 +110,41 @@ trait DeltaReadOptions extends DeltaOptionParser {
   }
 
   val ignoreFileDeletion = options.get(IGNORE_FILE_DELETION_OPTION)
-    .map(toBoolean(_, IGNORE_FILE_DELETION_OPTION)).getOrElse(false)
+    .exists(toBoolean(_, IGNORE_FILE_DELETION_OPTION))
 
-  val ignoreChanges = options.get(IGNORE_CHANGES_OPTION)
-    .map(toBoolean(_, IGNORE_CHANGES_OPTION)).getOrElse(false)
+  val ignoreChanges = options.get(IGNORE_CHANGES_OPTION).exists(toBoolean(_, IGNORE_CHANGES_OPTION))
 
-  val ignoreDeletes = options.get(IGNORE_DELETES_OPTION)
-    .map(toBoolean(_, IGNORE_DELETES_OPTION)).getOrElse(false)
+  val ignoreDeletes = options.get(IGNORE_DELETES_OPTION).exists(toBoolean(_, IGNORE_DELETES_OPTION))
+
+  val failOnDataLoss = options.get(FAIL_ON_DATA_LOSS_OPTION)
+    .forall(toBoolean(_, FAIL_ON_DATA_LOSS_OPTION)) // thanks to forall: by default true
 
   val excludeRegex: Option[Regex] = try options.get(EXCLUDE_REGEX_OPTION).map(_.r) catch {
     case e: PatternSyntaxException =>
       throw new IllegalArgumentException(
         s"Please recheck your syntax for '$EXCLUDE_REGEX_OPTION'", e)
   }
+
+  val startingVersion: Option[DeltaStartingVersion] = options.get(STARTING_VERSION_OPTION).map {
+    case "latest" => StartingVersionLatest
+    case str =>
+      Try(str.toLong).toOption.filter(_ >= 0).map(StartingVersion).getOrElse{
+        throw DeltaErrors.illegalDeltaOptionException(
+          STARTING_VERSION_OPTION, str, "must be greater than or equal to zero")
+      }
+  }
+
+  val startingTimestamp = options.get(STARTING_TIMESTAMP_OPTION)
+
+  private def provideOneStartingOption(): Unit = {
+    if (startingTimestamp.isDefined && startingVersion.isDefined) {
+      throw DeltaErrors.startingVersionAndTimestampBothSetException(
+        STARTING_VERSION_OPTION,
+        STARTING_TIMESTAMP_OPTION)
+    }
+  }
+
+  provideOneStartingOption()
 }
 
 
@@ -146,6 +169,8 @@ object DeltaOptions extends DeltaLogging {
   val MERGE_SCHEMA_OPTION = "mergeSchema"
   /** An option to allow overwriting schema and partitioning during an overwrite write operation. */
   val OVERWRITE_SCHEMA_OPTION = "overwriteSchema"
+  /** An option to specify user-defined metadata in commitInfo */
+  val USER_METADATA_OPTION = "userMetadata"
 
   val MAX_FILES_PER_TRIGGER_OPTION = "maxFilesPerTrigger"
   val MAX_FILES_PER_TRIGGER_OPTION_DEFAULT = 1000
@@ -154,20 +179,27 @@ object DeltaOptions extends DeltaLogging {
   val IGNORE_FILE_DELETION_OPTION = "ignoreFileDeletion"
   val IGNORE_CHANGES_OPTION = "ignoreChanges"
   val IGNORE_DELETES_OPTION = "ignoreDeletes"
+  val FAIL_ON_DATA_LOSS_OPTION = "failOnDataLoss"
   val OPTIMIZE_WRITE_OPTION = "optimizeWrite"
   val DATA_CHANGE_OPTION = "dataChange"
+  val STARTING_VERSION_OPTION = "startingVersion"
+  val STARTING_TIMESTAMP_OPTION = "startingTimestamp"
 
   val validOptionKeys : Set[String] = Set(
     REPLACE_WHERE_OPTION,
     MERGE_SCHEMA_OPTION,
     EXCLUDE_REGEX_OPTION,
     OVERWRITE_SCHEMA_OPTION,
+    USER_METADATA_OPTION,
     MAX_FILES_PER_TRIGGER_OPTION,
     IGNORE_FILE_DELETION_OPTION,
     IGNORE_CHANGES_OPTION,
     IGNORE_DELETES_OPTION,
+    FAIL_ON_DATA_LOSS_OPTION,
     OPTIMIZE_WRITE_OPTION,
     DATA_CHANGE_OPTION,
+    STARTING_TIMESTAMP_OPTION,
+    STARTING_VERSION_OPTION,
     "queryName",
     "checkpointLocation",
     "path",
@@ -187,3 +219,10 @@ object DeltaOptions extends DeltaLogging {
     }
   }
 }
+
+/**
+ * Definitions for the starting version of a Delta stream.
+ */
+sealed trait DeltaStartingVersion
+case object StartingVersionLatest extends DeltaStartingVersion
+case class StartingVersion(version: Long) extends DeltaStartingVersion
