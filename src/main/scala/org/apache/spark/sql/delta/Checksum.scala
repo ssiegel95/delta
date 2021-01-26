@@ -60,6 +60,9 @@ trait RecordChecksum extends DeltaLogging {
     CheckpointFileManager.create(deltaLog.logPath, spark.sessionState.newHadoopConf())
 
   protected def writeChecksumFile(snapshot: Snapshot): Unit = {
+    if (!spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_WRITE_CHECKSUM_ENABLED)) {
+      return
+    }
     val version = snapshot.version
     val checksum = VersionChecksum(
       tableSizeBytes = snapshot.sizeInBytes,
@@ -167,7 +170,7 @@ trait ValidateChecksum extends DeltaLogging { self: Snapshot =>
         throw new IllegalStateException(
           "The transaction log has failed integrity checks. We recommend you contact " +
             s"Databricks support for assistance. To disable this check, set ${conf.key} to " +
-            s"false. Failed verification of:\n${mismatchStringOpt.get}"
+            s"false. Failed verification at version $version of:\n${mismatchStringOpt.get}"
         )
       }
     }

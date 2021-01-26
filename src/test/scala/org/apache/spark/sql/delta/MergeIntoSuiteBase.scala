@@ -20,20 +20,15 @@ import java.io.File
 import java.lang.{Integer => JInt}
 import java.util.Locale
 
-import scala.collection.JavaConverters._
-
-import org.apache.spark.sql.delta.commands.MergeIntoCommand
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.scalatest.BeforeAndAfterEach
 
 import org.apache.spark.sql.{AnalysisException, DataFrame, QueryTest, Row}
-import org.apache.spark.sql.functions.lit
+import org.apache.spark.sql.execution.adaptive.DisableAdaptiveExecution
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.{SharedSparkSession, SQLTestUtils}
 import org.apache.spark.sql.types.{IntegerType, MapType, StringType, StructType}
-import org.apache.spark.status.api.v1.AccumulableInfo
 import org.apache.spark.util.Utils
-import org.apache.spark.util.kvstore.KVStore
 
 abstract class MergeIntoSuiteBase
     extends QueryTest
@@ -90,7 +85,7 @@ abstract class MergeIntoSuiteBase
   }
 
   Seq(true, false).foreach { isPartitioned =>
-    test(s"basic case, isPartitioned: $isPartitioned") {
+    test(s"basic case - merge to Delta table by path, isPartitioned: $isPartitioned") {
       withTable("source") {
         val partitions = if (isPartitioned) "key2" :: Nil else Nil
         append(Seq((2, 2), (1, 4)).toDF("key2", "value"), partitions)
@@ -114,7 +109,7 @@ abstract class MergeIntoSuiteBase
 
   Seq(true, false).foreach { skippingEnabled =>
     Seq(true, false).foreach { isPartitioned =>
-      test("basic case - merge to Delta table, " +
+      test("basic case - merge to view on a Delta table by path, " +
           s"isPartitioned: $isPartitioned skippingEnabled: $skippingEnabled") {
         withTable("delta_target", "source") {
           withSQLConf(DeltaSQLConf.DELTA_STATS_SKIPPING.key -> skippingEnabled.toString) {
@@ -137,6 +132,43 @@ abstract class MergeIntoSuiteBase
                 Row(-9, 16) :: // Insert
                 Nil)
           }
+        }
+      }
+    }
+  }
+
+  Seq(true, false).foreach { skippingEnabled =>
+    Seq(true, false).foreach { isPartitioned =>
+     test("basic case edge - merge to Delta table by name, " +
+         s"isPartitioned: $isPartitioned skippingEnabled: $skippingEnabled") {
+        withTable("delta_target", "source") {
+          withSQLConf(DeltaSQLConf.DELTA_STATS_SKIPPING.key -> skippingEnabled.toString) {
+            Seq((1, 1), (0, 3), (1, 6)).toDF("key1", "value").createOrReplaceTempView("source")
+            val partitionByClause = if (isPartitioned) "PARTITIONED BY (key2)" else ""
+            sql(
+              s"""
+                |CREATE TABLE delta_target(key2 INT, value INT)
+                |USING delta
+                |OPTIONS('path'='$tempPath')
+                |$partitionByClause
+               """.stripMargin)
+
+            append(Seq((2, 2), (1, 4)).toDF("key2", "value"))
+
+            executeMerge(
+              target = "delta_target",
+              source = "source src",
+              condition = "src.key1 = key2 AND src.value < delta_target.value",
+              update = "key2 = 20 + key1, value = 20 + src.value",
+              insert = "(key2, value) VALUES (key1 - 10, src.value + 10)")
+
+            checkAnswer(sql("SELECT key2, value FROM delta_target"),
+              Row(2, 2) :: // No change
+                Row(21, 21) :: // Update
+                Row(-10, 13) :: // Insert
+                Row(-9, 16) :: // Insert
+                Nil)
+            }
         }
       }
     }
@@ -419,23 +451,20 @@ abstract class MergeIntoSuiteBase
     }
   }
 
-  test("Self merge") {
-    withTable("selfMergeTable") {
-      append(Seq((2, 2), (1, 4)).toDF("key2", "value"))
-      readDeltaTable(tempPath).createOrReplaceTempView("selfMergeTable")
+  test("self merge") {
+    append(Seq((2, 2), (1, 4)).toDF("key2", "value"))
 
-      executeMerge(
-        target = "selfMergeTable as target",
-        source = "selfMergeTable as src",
-        condition = "src.key2 = target.key2",
-        update = "key2 = 20 + src.key2, value = 20 + src.value",
-        insert = "(key2, value) VALUES (src.key2 - 10, src.value + 10)")
+    executeMerge(
+      target = s"delta.`$tempPath` as target",
+      source = s"delta.`$tempPath` as src",
+      condition = "src.key2 = target.key2",
+      update = "key2 = 20 + src.key2, value = 20 + src.value",
+      insert = "(key2, value) VALUES (src.key2 - 10, src.value + 10)")
 
-      checkAnswer(readDeltaTable(tempPath),
-        Row(22, 22) :: // UPDATE
-          Row(21, 24) :: // UPDATE
-          Nil)
-    }
+    checkAnswer(readDeltaTable(tempPath),
+      Row(22, 22) :: // UPDATE
+        Row(21, 24) :: // UPDATE
+        Nil)
   }
 
   test("order by + limit in source query #1") {
@@ -553,6 +582,7 @@ abstract class MergeIntoSuiteBase
     assert(!errMsg.toLowerCase(Locale.ROOT).contains(str.toLowerCase(Locale.ROOT)))
   }
 
+
   test("Negative case - basic syntax analysis") {
     withTable("source") {
       Seq((1, 1), (0, 3), (1, 5)).toDF("key1", "value").createOrReplaceTempView("source")
@@ -568,8 +598,7 @@ abstract class MergeIntoSuiteBase
           insert = "(key2, value) VALUES (3, src.value + key2)")
       }.getMessage
 
-      errorContains(e, "Cannot resolve `key2` in INSERT clause")
-      errorContains(e, "key1") // should contain key1 as a valid column name in expressions
+      errorContains(e, "cannot resolve `key2`")
 
       // to-update columns have source table reference
       e = intercept[AnalysisException] {
@@ -880,16 +909,17 @@ abstract class MergeIntoSuiteBase
     }
   }
 
-  test("merge into cached table") {
+  test("merge into cached table edge") {
+    // Merge with a cached target only works in the join-based implementation right now
     withTable("source") {
       append(Seq((2, 2), (1, 4)).toDF("key2", "value"))
       Seq((1, 1), (0, 3), (3, 3)).toDF("key1", "value").createOrReplaceTempView("source")
-      readDeltaTable(tempPath).cache()
-      readDeltaTable(tempPath).collect()
+      spark.table(s"delta.`$tempPath`").cache()
+      spark.table(s"delta.`$tempPath`").collect()
 
       append(Seq((100, 100), (3, 5)).toDF("key2", "value"))
       // cache is in effect, as the above change is not reflected
-      checkAnswer(readDeltaTable(tempPath), Row(2, 2) :: Row(1, 4) :: Nil)
+      checkAnswer(spark.table(s"delta.`$tempPath`"), Row(2, 2) :: Row(1, 4) :: Nil)
 
       executeMerge(
         target = s"delta.`$tempPath` as trgNew",
@@ -898,7 +928,7 @@ abstract class MergeIntoSuiteBase
         update = "value = trgNew.value + 3",
         insert = "(key2, value) VALUES (key1, src.value + 10)")
 
-      checkAnswer(readDeltaTable(tempPath),
+      checkAnswer(spark.table(s"delta.`$tempPath`"),
         Row(100, 100) :: // No change (newly inserted record)
           Row(2, 2) :: // No change
           Row(1, 7) :: // Update
@@ -1107,12 +1137,13 @@ abstract class MergeIntoSuiteBase
   }
 
   protected def testAnalysisErrorsInExtendedMerge(
-      name: String)(
+      name: String,
+      namePrefix: String = "extended syntax")(
       mergeOn: String,
       mergeClauses: MergeClause*)(
       errorStrs: Seq[String],
       notErrorStrs: Seq[String] = Nil): Unit = {
-    test(s"extended syntax analysis errors - $name") {
+    test(s"$namePrefix - analysis errors - $name") {
       withKeyValueData(
         source = Seq.empty,
         target = Seq.empty,
@@ -1198,14 +1229,15 @@ abstract class MergeIntoSuiteBase
 
 
   protected def testExtendedMerge(
-      name: String)(
+      name: String,
+      namePrefix: String = "extended syntax")(
       source: Seq[(Int, Int)],
       target: Seq[(Int, Int)],
       mergeOn: String,
       mergeClauses: MergeClause*)(
       result: Seq[(Int, Int)]): Unit = {
     Seq(true, false).foreach { isPartitioned =>
-      test(s"extended syntax - $name - isPartitioned: $isPartitioned ") {
+      test(s"$namePrefix - $name - isPartitioned: $isPartitioned ") {
         withKeyValueData(source, target, isPartitioned) { case (sourceName, targetName) =>
           withSQLConf(DeltaSQLConf.MERGE_INSERT_ONLY_ENABLED.key -> "true") {
             executeMerge(s"$targetName t", s"$sourceName s", mergeOn, mergeClauses: _*)
@@ -1221,6 +1253,22 @@ abstract class MergeIntoSuiteBase
     }
   }
 
+  protected def testExtendedMergeErrorOnMultipleMatches(
+      name: String)(
+      source: Seq[(Int, Int)],
+      target: Seq[(Int, Int)],
+      mergeOn: String,
+      mergeClauses: MergeClause*): Unit = {
+    test(s"extended syntax - $name") {
+      withKeyValueData(source, target) { case (sourceName, targetName) =>
+        val errMsg = intercept[UnsupportedOperationException] {
+          executeMerge(s"$targetName t", s"$sourceName s", mergeOn, mergeClauses: _*)
+        }.getMessage.toLowerCase(Locale.ROOT)
+        assert(errMsg.contains("cannot perform merge as multiple source rows matched"))
+      }
+    }
+  }
+
   testExtendedMerge("only update")(
     source = (0, 0) :: (1, 10) :: (3, 30) :: Nil,
     target = (1, 1) :: (2, 2)  :: Nil,
@@ -1231,21 +1279,11 @@ abstract class MergeIntoSuiteBase
       (2, 2)
     ))
 
-
-  test(s"extended syntax - only update with multiple matches") {
-    withKeyValueData(
-      source = (0, 0) :: (1, 10) :: (1, 11) :: (2, 20) :: Nil,
-      target = (1, 1) :: (2, 2) :: Nil
-    ) { case (sourceName, targetName) =>
-      intercept[UnsupportedOperationException] {
-        executeMerge(
-          s"$targetName t",
-          s"$sourceName s",
-          "s.key = t.key",
-          update(set = "key = s.key, value = s.value"))
-      }
-    }
-  }
+  testExtendedMergeErrorOnMultipleMatches("only update with multiple matches")(
+    source = (0, 0) :: (1, 10) :: (1, 11) :: (2, 20) :: Nil,
+    target = (1, 1) :: (2, 2) :: Nil,
+    mergeOn = "s.key = t.key",
+    update(set = "key = s.key, value = s.value"))
 
   testExtendedMerge("only conditional update")(
     source = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: Nil,
@@ -1258,6 +1296,12 @@ abstract class MergeIntoSuiteBase
       (3, 3)    // not updated due to target-only condition `t.value <> 3`
     ))
 
+  testExtendedMergeErrorOnMultipleMatches("only conditional update with multiple matches")(
+    source = (0, 0) :: (1, 10) :: (1, 11) :: (2, 20) :: Nil,
+    target = (1, 1) :: (2, 2) :: Nil,
+    mergeOn = "s.key = t.key",
+    update(condition = "s.value = 10", set = "key = s.key, value = s.value"))
+
   testExtendedMerge("only delete")(
     source = (0, 0) :: (1, 10) :: (3, 30) :: Nil,
     target = (1, 1) :: (2, 2) :: Nil,
@@ -1267,16 +1311,16 @@ abstract class MergeIntoSuiteBase
       (2, 2)    // (1, 1) deleted
     ))          // (3, 30) not inserted as not insert clause
 
-  test(s"extended syntax - only delete with multiple matches") {
-    withKeyValueData(
-      source = (0, 0) :: (1, 10) :: (1, 100) :: (3, 30) :: Nil,
-      target = (1, 1) :: (2, 2) :: Nil
-    ) { case (sourceName, targetName) =>
-      intercept[UnsupportedOperationException] {
-        executeMerge(s"$targetName t", s"$sourceName s", "s.key = t.key", delete())
-      }
-    }
-  }
+  // This is not ambiguous even when there are multiple matches
+  testExtendedMerge(s"only delete with multiple matches")(
+    source = (0, 0) :: (1, 10) :: (1, 100) :: (3, 30) :: Nil,
+    target = (1, 1) :: (2, 2) :: Nil,
+    mergeOn = "s.key = t.key",
+    delete())(
+    result = Seq(
+      (2, 2)  // (1, 1) matches multiple source rows but unambiguously deleted
+    )
+  )
 
   testExtendedMerge("only conditional delete")(
     source = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: Nil,
@@ -1287,6 +1331,12 @@ abstract class MergeIntoSuiteBase
       (2, 2),   // not deleted due to source-only condition `s.value <> 20`
       (3, 3)    // not deleted due to target-only condition `t.value <> 3`
     ))          // (1, 1) deleted
+
+  testExtendedMergeErrorOnMultipleMatches("only conditional delete with multiple matches")(
+    source = (0, 0) :: (1, 10) :: (1, 100) :: (2, 20) :: Nil,
+    target = (1, 1) :: (2, 2) :: Nil,
+    mergeOn = "s.key = t.key",
+    delete(condition = "s.value = 10"))
 
   testExtendedMerge("conditional update + delete")(
     source = (0, 0) :: (1, 10) :: (2, 20) :: Nil,
@@ -1299,6 +1349,13 @@ abstract class MergeIntoSuiteBase
       (3, 3)
     ))
 
+  testExtendedMergeErrorOnMultipleMatches("conditional update + delete with multiple matches")(
+    source = (0, 0) :: (1, 10) :: (2, 20) :: (2, 200) :: Nil,
+    target = (1, 1) :: (2, 2) :: Nil,
+    mergeOn = "s.key = t.key",
+    update(condition = "s.value = 20", set = "key = s.key, value = s.value"),
+    delete())
+
   testExtendedMerge("conditional update + conditional delete")(
     source = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: Nil,
     target = (1, 1) :: (2, 2) :: (3, 3) :: (4, 4) :: Nil,
@@ -1310,6 +1367,14 @@ abstract class MergeIntoSuiteBase
       (3, 30),  // (3, 3) updated even though it matched update and delete conditions, as update 1st
       (4, 4)
     ))          // (1, 1) deleted as it matched delete condition
+
+  testExtendedMergeErrorOnMultipleMatches(
+    "conditional update + conditional delete with multiple matches")(
+    source = (0, 0) :: (1, 10) :: (1, 100) :: (2, 20) :: (2, 200) :: Nil,
+    target = (1, 1) :: (2, 2) :: Nil,
+    mergeOn = "s.key = t.key",
+    update(condition = "s.value = 20", set = "key = s.key, value = s.value"),
+    delete(condition = "s.value = 10"))
 
   testExtendedMerge("conditional delete + conditional update (order matters)")(
     source = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: Nil,
@@ -1382,6 +1447,20 @@ abstract class MergeIntoSuiteBase
       (2, 2)
     ))
 
+  testExtendedMerge(s"delete + insert with multiple matches for both") (
+    source = (1, 10) :: (1, 100) :: (3, 30) :: (3, 300) :: Nil,
+    target = (1, 1) :: (2, 2) :: Nil,
+    mergeOn = "s.key = t.key",
+    delete(),
+    insert(values = "(key, value) VALUES (s.key, s.value)")) (
+    result = Seq(
+               // (1, 1) matches multiple source rows but unambiguously deleted
+      (2, 2),  // existed previously
+      (3, 30), // inserted
+      (3, 300) // inserted
+    )
+  )
+
   testExtendedMerge("conditional update + conditional delete + conditional insert")(
     source = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: (4, 40) :: Nil,
     target = (1, 1) :: (2, 2) :: (3, 3) :: Nil,
@@ -1394,6 +1473,15 @@ abstract class MergeIntoSuiteBase
       (3, 3),   // neither updated nor deleted as it matched neither condition
       (4, 40)   // (4, 40) inserted by condition, but not (0, 0)
     ))          // (2, 2) deleted by condition but not (1, 1) or (3, 3)
+
+  testExtendedMergeErrorOnMultipleMatches(
+    "conditional update + conditional delete + conditional insert with multiple matches")(
+    source = (0, 0) :: (1, 10) :: (1, 100) :: (2, 20) :: (2, 200) :: Nil,
+    target = (1, 1) :: (2, 2) :: Nil,
+    mergeOn = "s.key = t.key",
+    update(condition = "s.value = 20", set = "key = s.key, value = s.value"),
+    delete(condition = "s.value = 10"),
+    insert(condition = "s.value = 0", values = "(key, value) VALUES (s.key, s.value)"))
 
   // complex merge condition = has target-only and source-only predicates
   testExtendedMerge(
@@ -1674,14 +1762,61 @@ abstract class MergeIntoSuiteBase
   test("insert only merge - turn off feature flag") {
     withSQLConf(DeltaSQLConf.MERGE_INSERT_ONLY_ENABLED.key -> "false") {
       withKeyValueData(
-        source = (0, 0) :: (1, 10) :: (1, 100) :: (3, 30) :: (3, 300) :: Nil,
-        target = (1, 1) :: (2, 2) :: Nil
+        source = (1, 10) :: (3, 30) :: Nil,
+        target = (1, 1) :: Nil
       ) { case (sourceName, targetName) =>
-        intercept[UnsupportedOperationException] {
-          // This is supposed to fail as the duplicated keys in source were not supported.
-          executeMerge(s"$targetName t", s"$sourceName s", "s.key = t.key",
+        executeMerge(
+          s"$targetName t",
+          s"$sourceName s",
+          "s.key = t.key",
+          insert(values = "(key, value) VALUES (s.key, s.value)"))
+
+        checkAnswer(sql(s"SELECT key, value FROM $targetName"),
+          Row(1, 1) :: Row(3, 30) :: Nil)
+
+        val metrics = spark.sql(s"DESCRIBE HISTORY $targetName LIMIT 1")
+          .select("operationMetrics")
+          .collect().head.getMap(0).asInstanceOf[Map[String, String]]
+        assert(metrics.contains("numTargetFilesRemoved"))
+        // If insert-only code path is not used, then the general code path will rewrite existing
+        // target files.
+        assert(metrics("numTargetFilesRemoved").toInt > 0)
+      }
+    }
+  }
+
+  test("insert only merge - multiple matches when feature flag off") {
+    withSQLConf(DeltaSQLConf.MERGE_INSERT_ONLY_ENABLED.key -> "false") {
+      // Verify that in case of multiple matches, it throws error rather than producing
+      // incorrect results.
+      withKeyValueData(
+        source = (1, 10) :: (1, 100) :: (2, 20) :: Nil,
+        target = (1, 1) :: Nil
+      ) { case (sourceName, targetName) =>
+        val errMsg = intercept[UnsupportedOperationException] {
+          executeMerge(
+            s"$targetName t",
+            s"$sourceName s",
+            "s.key = t.key",
             insert(values = "(key, value) VALUES (s.key, s.value)"))
-        }
+        }.getMessage.toLowerCase(Locale.ROOT)
+        assert(errMsg.contains("cannot perform merge as multiple source rows matched"))
+      }
+
+      // Verify that in case of multiple matches, it throws error rather than producing
+      // incorrect results.
+      withKeyValueData(
+        source = (1, 10) :: (1, 100) :: (2, 20) :: (2, 200) :: Nil,
+        target = (1, 1) :: Nil
+      ) { case (sourceName, targetName) =>
+        val errMsg = intercept[UnsupportedOperationException] {
+          executeMerge(
+            s"$targetName t",
+            s"$sourceName s",
+            "s.key = t.key",
+            insert(condition = "s.value = 20", values = "(key, value) VALUES (s.key, s.value)"))
+        }.getMessage.toLowerCase(Locale.ROOT)
+        assert(errMsg.contains("cannot perform merge as multiple source rows matched"))
       }
     }
   }
@@ -1692,7 +1827,8 @@ abstract class MergeIntoSuiteBase
       srcRange: Range,
       expectLessFilesWithRepartition: Boolean,
       clauses: MergeClause*): Unit = {
-    test(s"merge with repartition - $name") {
+    test(s"merge with repartition - $name",
+      DisableAdaptiveExecution("AQE coalese would partition number")) {
       withTempView("source") {
         withTempDir { basePath =>
           val tgt1 = basePath + "target"
@@ -1764,52 +1900,6 @@ abstract class MergeIntoSuiteBase
     insert("(id, part1, part2) VALUES (id, part1, part2)")
   )
 
-  test("accumulators used by MERGE should not be tracked by Spark UI") {
-    // Run a simple merge command
-    withTable("source") {
-      append(Seq((2, 2), (1, 4)).toDF("key2", "value"))
-      Seq((1, 1), (0, 3)).toDF("key1", "value").createOrReplaceTempView("source")
-
-      executeMerge(
-        target = s"delta.`$tempPath`",
-        source = "source src",
-        condition = "src.key1 = key2",
-        update = "key2 = 20 + key1, value = 20 + src.value",
-        insert = "(key2, value) VALUES (key1 - 10, src.value + 10)")
-
-      checkAnswer(readDeltaTable(tempPath),
-        Row(2, 2) :: // No change
-          Row(21, 21) :: // Update
-          Row(-10, 13) :: // Insert
-          Nil)
-    }
-
-    // Make sure all Spark events generated by the above command have been processed
-    spark.sparkContext.listenerBus.waitUntilEmpty(30000)
-
-    // Use Reflection to get `SparkContext.statusStore.store` and access all accumulators stored
-    // with Spark tasks, so that this test can be run with Apache Spark.
-    val statusStore =
-      spark.sparkContext.getClass.getMethod("statusStore").invoke(spark.sparkContext)
-    val store = statusStore.getClass.getMethod("store").invoke(statusStore).asInstanceOf[KVStore]
-    // scalastyle:off classforname
-    val iter = store
-      .view(Class.forName("org.apache.spark.status.TaskDataWrapper"))
-      .closeableIterator()
-    // scalastyle:on classforname
-    try {
-      // Collect all accumulator names tracked by Spark UI.
-      val accumNames = iter.asScala.toVector.flatMap { task =>
-        task.getClass.getMethod("accumulatorUpdates").invoke(task)
-          .asInstanceOf[Seq[AccumulableInfo]].map(_.name)
-      }.toSet
-      // Verify accumulators used by MergeIntoCommand are not tracked.
-      assert(!accumNames.contains(MergeIntoCommand.TOUCHED_FILES_ACCUM_NAME))
-    } finally {
-      iter.close()
-    }
-  }
-
   protected def testMatchedOnlyOptimization(
       name: String)(
       source: Seq[(Int, Int)],
@@ -1879,7 +1969,8 @@ abstract class MergeIntoSuiteBase
       withSQLConf(DeltaSQLConf.MERGE_MATCHED_ONLY_ENABLED.key -> "true") {
         test(s"matched only merge - null handling - $name, isPartitioned: $isPartitioned") {
           withView("sourceView") {
-            append(target.toDF("key", "value"), "key" :: Nil)
+            val partitions = if (isPartitioned) "key" :: Nil else Nil
+            append(target.toDF("key", "value"), partitions)
             source.toDF("key", "value").createOrReplaceTempView("sourceView")
 
             executeMerge(
@@ -1919,7 +2010,7 @@ abstract class MergeIntoSuiteBase
     )
   )
 
-  private def testEvolution(name: String)(
+  protected def testEvolution(name: String)(
       targetData: => DataFrame,
       sourceData: => DataFrame,
       update: String = null,
@@ -2141,4 +2232,230 @@ abstract class MergeIntoSuiteBase
     expectErrorContains = "cannot cast struct",
     expectErrorWithoutEvolutionContains = "cannot cast struct"
   )
+
+  /* unlimited number of merge clauses tests */
+
+  protected def testUnlimitedClauses(
+      name: String)(
+      source: Seq[(Int, Int)],
+      target: Seq[(Int, Int)],
+      mergeOn: String,
+      mergeClauses: MergeClause*)(
+      result: Seq[(Int, Int)]): Unit =
+    testExtendedMerge(name, "unlimited clauses")(source, target, mergeOn, mergeClauses : _*)(result)
+
+  protected def testAnalysisErrorsInUnlimitedClauses(
+      name: String)(
+      mergeOn: String,
+      mergeClauses: MergeClause*)(
+      errorStrs: Seq[String],
+      notErrorStrs: Seq[String] = Nil): Unit =
+    testAnalysisErrorsInExtendedMerge(name, "unlimited clauses")(mergeOn, mergeClauses : _*)(
+      errorStrs, notErrorStrs)
+
+  testUnlimitedClauses("two conditional update + two conditional delete + insert")(
+    source = (0, 0) :: (1, 100) :: (3, 300) :: (4, 400) :: (5, 500) :: Nil,
+    target = (1, 10) :: (2, 20) :: (3, 30) :: (4, 40) :: Nil,
+    mergeOn = "s.key = t.key",
+    delete(condition = "s.key < 2"),
+    delete(condition = "s.key > 4"),
+    update(condition = "s.key == 3", set = "key = s.key, value = s.value"),
+    update(condition = "s.key == 4", set = "key = s.key, value = 2 * s.value"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, s.value)"))(
+    result = Seq(
+      (0, 0),    // insert (0, 0)
+                 // delete (1, 10)
+      (2, 20),   // neither updated nor deleted as it didn't match
+      (3, 300),  // update (3, 30)
+      (4, 800),  // update (4, 40)
+      (5, 500)   // insert (5, 500)
+    ))
+
+  testUnlimitedClauses("two conditional delete + conditional update + update + insert")(
+    source = (0, 0) :: (1, 100) :: (2, 200) :: (3, 300) :: (4, 400) :: Nil,
+    target = (1, 10) :: (2, 20) :: (3, 30) :: (4, 40) :: Nil,
+    mergeOn = "s.key = t.key",
+    delete(condition = "s.key < 2"),
+    delete(condition = "s.key > 3"),
+    update(condition = "s.key == 2", set = "key = s.key, value = s.value"),
+    update(condition = null, set = "key = s.key, value = 2 * s.value"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, s.value)"))(
+    result = Seq(
+      (0, 0),   // insert (0, 0)
+                // delete (1, 10)
+      (2, 200), // update (2, 20)
+      (3, 600)  // update (3, 30)
+                // delete (4, 40)
+    ))
+
+  testUnlimitedClauses("conditional delete + two conditional update + two conditional insert")(
+    source = (1, 100) :: (2, 200) :: (3, 300) :: (4, 400) :: (6, 600) :: Nil,
+    target = (1, 10) :: (2, 20) :: (3, 30) :: Nil,
+    mergeOn = "s.key = t.key",
+    delete(condition = "s.key < 2"),
+    update(condition = "s.key == 2", set = "key = s.key, value = s.value"),
+    update(condition = "s.key == 3", set = "key = s.key, value = 2 * s.value"),
+    insert(condition = "s.key < 5", values = "(key, value) VALUES (s.key, s.value)"),
+    insert(condition = "s.key > 5", values = "(key, value) VALUES (s.key, 1 + s.value)"))(
+    result = Seq(
+                // delete (1, 10)
+      (2, 200), // update (2, 20)
+      (3, 600), // update (3, 30)
+      (4, 400), // insert (4, 400)
+      (6, 601)  // insert (6, 600)
+    ))
+
+  testUnlimitedClauses("conditional update + update + conditional delete + conditional insert")(
+    source = (1, 100) :: (2, 200) :: (3, 300) :: (4, 400) :: (5, 500) :: Nil,
+    target = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: Nil,
+    mergeOn = "s.key = t.key",
+    update(condition = "s.key < 2", set = "key = s.key, value = s.value"),
+    update(condition = "s.key < 3", set = "key = s.key, value = 2 * s.value"),
+    delete(condition = "s.key < 4"),
+    insert(condition = "s.key > 4", values = "(key, value) VALUES (s.key, s.value)"))(
+    result = Seq(
+      (0, 0),   // no change
+      (1, 100), // (1, 10) updated by matched_0
+      (2, 400), // (2, 20) updated by matched_1
+                // (3, 30) deleted by matched_2
+      (5, 500)  // (5, 500) inserted
+    ))
+
+  testUnlimitedClauses("conditional insert + insert")(
+    source = (1, 100) :: (2, 200) :: (3, 300) :: (4, 400) :: (5, 500) :: Nil,
+    target = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: Nil,
+    mergeOn = "s.key = t.key",
+    insert(condition = "s.key < 5", values = "(key, value) VALUES (s.key, s.value)"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, s.value + 1)"))(
+    result = Seq(
+      (0, 0),   // no change
+      (1, 10),  // no change
+      (2, 20),  // no change
+      (3, 30),  // no change
+      (4, 400), // (4, 400) inserted by notMatched_0
+      (5, 501)  // (5, 501) inserted by notMatched_1
+    ))
+
+  testUnlimitedClauses("2 conditional inserts")(
+    source = (1, 100) :: (2, 200) :: (3, 300) :: (4, 400) :: (5, 500) :: (6, 600) :: Nil,
+    target = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: Nil,
+    mergeOn = "s.key = t.key",
+    insert(condition = "s.key < 5", values = "(key, value) VALUES (s.key, s.value)"),
+    insert(condition = "s.key = 5", values = "(key, value) VALUES (s.key, s.value + 1)"))(
+    result = Seq(
+      (0, 0),   // no change
+      (1, 10),  // no change
+      (2, 20),  // no change
+      (3, 30),  // no change
+      (4, 400), // (4, 400) inserted by notMatched_0
+      (5, 501)  // (5, 501) inserted by notMatched_1
+                // (6, 600) not inserted as not insert condition matched
+    ))
+
+  testUnlimitedClauses("update/delete (no matches) + conditional insert + insert")(
+    source = (4, 400) :: (5, 500) :: Nil,
+    target = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: Nil,
+    mergeOn = "s.key = t.key",
+    update(condition = "t.key = 0", set = "key = s.key, value = s.value"),
+    delete(condition = null),
+    insert(condition = "s.key < 5", values = "(key, value) VALUES (s.key, s.value)"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, s.value + 1)"))(
+    result = Seq(
+      (0, 0),   // no change
+      (1, 10),  // no change
+      (2, 20),  // no change
+      (3, 30),  // no change
+      (4, 400), // (4, 400) inserted by notMatched_0
+      (5, 501)  // (5, 501) inserted by notMatched_1
+    ))
+
+  testUnlimitedClauses("update/delete (no matches) + 2 conditional inserts")(
+    source = (4, 400) :: (5, 500) :: (6, 600)  :: Nil,
+    target = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: Nil,
+    mergeOn = "s.key = t.key",
+    update(condition = "t.key = 0", set = "key = s.key, value = s.value"),
+    delete(condition = null),
+    insert(condition = "s.key < 5", values = "(key, value) VALUES (s.key, s.value)"),
+    insert(condition = "s.key = 5", values = "(key, value) VALUES (s.key, s.value + 1)"))(
+    result = Seq(
+      (0, 0),   // no change
+      (1, 10),  // no change
+      (2, 20),  // no change
+      (3, 30),  // no change
+      (4, 400), // (4, 400) inserted by notMatched_0
+      (5, 501)  // (5, 501) inserted by notMatched_1
+                // (6, 600) not inserted as not insert condition matched
+    ))
+
+  testUnlimitedClauses("2 update + 2 delete + 4 insert")(
+    source = (1, 100) :: (2, 200) :: (3, 300) :: (4, 400) :: (5, 500) :: (6, 600) :: (7, 700) ::
+      (8, 800) :: (9, 900) :: Nil,
+    target = (0, 0) :: (1, 10) :: (2, 20) :: (3, 30) :: (4, 40) :: Nil,
+    mergeOn = "s.key = t.key",
+    update(condition = "s.key == 1", set = "key = s.key, value = s.value"),
+    delete(condition = "s.key == 2"),
+    update(condition = "s.key == 3", set = "key = s.key, value = 2 * s.value"),
+    delete(condition = null),
+    insert(condition = "s.key == 5", values = "(key, value) VALUES (s.key, s.value)"),
+    insert(condition = "s.key == 6", values = "(key, value) VALUES (s.key, 1 + s.value)"),
+    insert(condition = "s.key == 7", values = "(key, value) VALUES (s.key, 2 + s.value)"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, 3 + s.value)"))(
+    result = Seq(
+      (0, 0),    // no change
+      (1, 100),  // (1, 10) updated by matched_0
+                 // (2, 20) deleted by matched_1
+      (3, 600),  // (3, 30) updated by matched_2
+                 // (4, 40) deleted by matched_3
+      (5, 500),  // (5, 500) inserted by notMatched_0
+      (6, 601),  // (6, 600) inserted by notMatched_1
+      (7, 702),  // (7, 700) inserted by notMatched_2
+      (8, 803),  // (8, 800) inserted by notMatched_3
+      (9, 903)   // (9, 900) inserted by notMatched_3
+    ))
+
+  testAnalysisErrorsInUnlimitedClauses("error on multiple insert clauses without condition")(
+    mergeOn = "s.key = t.key",
+    update(condition = "s.key == 3", set = "key = s.key, value = 2 * srcValue"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, srcValue)"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, 1 + srcValue)"))(
+    errorStrs = "when there are more than one not matched clauses in a merge statement, " +
+      "only the last not matched clause can omit the condition" :: Nil)
+
+  testAnalysisErrorsInUnlimitedClauses("error on multiple update clauses without condition")(
+    mergeOn = "s.key = t.key",
+    update(condition = "s.key == 3", set = "key = s.key, value = 2 * srcValue"),
+    update(condition = null, set = "key = s.key, value = 3 * srcValue"),
+    update(condition = null, set = "key = s.key, value = 4 * srcValue"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, srcValue)"))(
+    errorStrs = "when there are more than one matched clauses in a merge statement, " +
+      "only the last matched clause can omit the condition" :: Nil)
+
+  testAnalysisErrorsInUnlimitedClauses("error on multiple update/delete clauses without condition")(
+    mergeOn = "s.key = t.key",
+    update(condition = "s.key == 3", set = "key = s.key, value = 2 * srcValue"),
+    delete(condition = null),
+    update(condition = null, set = "key = s.key, value = 4 * srcValue"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, srcValue)"))(
+    errorStrs = "when there are more than one matched clauses in a merge statement, " +
+      "only the last matched clause can omit the condition" :: Nil)
+
+  testAnalysisErrorsInUnlimitedClauses(
+    "error on non-empty condition following empty condition for update clauses")(
+    mergeOn = "s.key = t.key",
+    update(condition = null, set = "key = s.key, value = 2 * srcValue"),
+    update(condition = "s.key < 3", set = "key = s.key, value = srcValue"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, srcValue)"))(
+    errorStrs = "when there are more than one matched clauses in a merge statement, " +
+      "only the last matched clause can omit the condition" :: Nil)
+
+  testAnalysisErrorsInUnlimitedClauses(
+    "error on non-empty condition following empty condition for insert clauses")(
+    mergeOn = "s.key = t.key",
+    update(condition = null, set = "key = s.key, value = srcValue"),
+    insert(condition = null, values = "(key, value) VALUES (s.key, srcValue)"),
+    insert(condition = "s.key < 3", values = "(key, value) VALUES (s.key, 1 + srcValue)"))(
+    errorStrs = "when there are more than one not matched clauses in a merge statement, " +
+      "only the last not matched clause can omit the condition" :: Nil)
+
+  /* end unlimited number of merge clauses tests */
 }

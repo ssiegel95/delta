@@ -14,12 +14,8 @@
 # limitations under the License.
 #
 
-import sys
-import tempfile
-from pyspark import SparkContext
 from pyspark import since
-from pyspark.sql import Column, DataFrame, SparkSession, SQLContext, functions
-from py4j.java_collections import MapConverter
+from pyspark.sql import Column, DataFrame, functions
 
 
 class DeltaTable(object):
@@ -317,6 +313,28 @@ class DeltaTable(object):
         return DeltaTable(sparkSession, jdt)
 
     @classmethod
+    @since(0.7)
+    def forName(cls, sparkSession, tableOrViewName):
+        """
+        Create a DeltaTable using the given table or view name using the given SparkSession.
+
+        :param sparkSession: SparkSession to use for loading the table
+        :param tableOrViewName: name of the table or view
+        :return: loaded Delta table
+        :rtype: :py:class:`~delta.tables.DeltaTable`
+
+        Example::
+
+            deltaTable = DeltaTable.forName(spark, "tblName")
+
+        .. note:: Evolving
+        """
+        assert sparkSession is not None
+        jdt = sparkSession._sc._jvm.io.delta.tables.DeltaTable.forName(
+            sparkSession._jsparkSession, tableOrViewName)
+        return DeltaTable(sparkSession, jdt)
+
+    @classmethod
     @since(0.4)
     def isDeltaTable(cls, sparkSession, identifier):
         """
@@ -337,6 +355,27 @@ class DeltaTable(object):
         assert sparkSession is not None
         return sparkSession._sc._jvm.io.delta.tables.DeltaTable.isDeltaTable(
             sparkSession._jsparkSession, identifier)
+
+    @since(0.8)
+    def upgradeTableProtocol(self, readerVersion, writerVersion):
+        """
+        Updates the protocol version of the table to leverage new features. Upgrading the reader
+        version will prevent all clients that have an older version of Delta Lake from accessing
+        this table. Upgrading the writer version will prevent older versions of Delta Lake to write
+        to this table. The reader or writer version cannot be downgraded.
+
+        See online documentation and Delta's protocol specification at PROTOCOL.md for more details.
+
+        .. note:: Evolving
+        """
+        jdt = self._jdt
+        if not isinstance(readerVersion, int):
+            raise ValueError("The readerVersion needs to be an integer but got '%s'." %
+                             type(readerVersion))
+        if not isinstance(writerVersion, int):
+            raise ValueError("The writerVersion needs to be an integer but got '%s'." %
+                             type(writerVersion))
+        jdt.upgradeTableProtocol(readerVersion, writerVersion)
 
     @classmethod
     def _dict_to_jmap(cls, sparkSession, pydict, argname):
